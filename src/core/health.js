@@ -2,7 +2,7 @@
  * Core health/discovery/launch logic.
  */
 import { getClient, getTargetInfo, evaluate } from '../connection.js';
-import { existsSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 
 export async function healthCheck() {
@@ -159,6 +159,31 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
+function findWindowsAppsTradingView() {
+  // Use Get-AppxPackage — works without admin rights, version-agnostic
+  try {
+    const result = execSync(
+      'powershell -NoProfile -NonInteractive -Command "(Get-AppxPackage -Name \'*TradingView*\').InstallLocation"',
+      { timeout: 5000 }
+    ).toString().trim();
+    if (result) {
+      const exePath = `${result}\\TradingView.exe`;
+      if (existsSync(exePath)) return [exePath];
+    }
+  } catch { /* powershell not available or package not found */ }
+  // Fallback: direct directory scan (requires elevated context)
+  try {
+    const base = 'C:\\Program Files\\WindowsApps';
+    const dirs = readdirSync(base, { withFileTypes: true });
+    return dirs
+      .filter(d => d.isDirectory() && d.name.startsWith('TradingView.Desktop_'))
+      .map(d => `${base}\\${d.name}\\TradingView.exe`)
+      .filter(p => existsSync(p));
+  } catch {
+    return [];
+  }
+}
+
 export async function launch({ port, kill_existing } = {}) {
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;
@@ -173,6 +198,7 @@ export async function launch({ port, kill_existing } = {}) {
       `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
       `${process.env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
       `${process.env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
+      ...findWindowsAppsTradingView(),
     ],
     linux: [
       '/opt/TradingView/tradingview',
