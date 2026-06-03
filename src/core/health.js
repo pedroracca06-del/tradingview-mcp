@@ -185,7 +185,7 @@ function findWindowsAppsTradingView() {
 }
 
 export async function launch({ port, kill_existing } = {}) {
-  const cdpPort = port || 9222;
+  const cdpPort = port || parseInt(process.env.TV_CDP_PORT || '9222', 10);
   const killFirst = kill_existing !== false;
   const platform = process.platform;
 
