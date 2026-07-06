@@ -6,6 +6,7 @@
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
 // ── Monaco finder (injected into TV page) ──
+// Strategy 1: React fiber traversal (pre-2026 TradingView)
 const FIND_MONACO = `
   (function findMonacoEditor() {
     var container = document.querySelector('.monaco-editor.pine-editor-monaco');
@@ -15,6 +16,10 @@ const FIND_MONACO = `
     for (var i = 0; i < 20; i++) {
       if (!el) break;
       fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
+      if (!fiberKey) {
+        var allKeys = Object.getOwnPropertyNames(el);
+        fiberKey = allKeys.find(function(k) { return k.startsWith('__reactFiber') || k.startsWith('__reactInternals'); });
+      }
       if (fiberKey) break;
       el = el.parentElement;
     }
@@ -35,19 +40,33 @@ const FIND_MONACO = `
   })()
 `;
 
+// Strategy 2: DOM-presence check (works when fiber unavailable — post-2026 TV update)
+const EDITOR_DOM_PRESENT = `
+  (function() {
+    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
+    if (!container) return null;
+    // Find the accessible textarea (aria-label contains "Editor content")
+    var textarea = container.querySelector('textarea[aria-label]')
+      || document.querySelector('textarea[aria-label*="Editor content"]')
+      || document.querySelector('.monaco-editor.pine-editor-monaco textarea');
+    return textarea ? { x: textarea.getBoundingClientRect().x, y: textarea.getBoundingClientRect().y } : { x: -1, y: -1 };
+  })()
+`;
+
 /**
  * Opens the Pine Editor panel and waits for Monaco to become available.
- * Returns true if editor is accessible, false on timeout.
+ * Returns { mode: 'fiber'|'dom', ... } on success, false on failure.
  */
 export async function ensurePineEditorOpen() {
-  const already = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      return m !== null;
-    })()
-  `);
-  if (already) return true;
+  // Strategy 1: try fiber approach
+  const fiberReady = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+  if (fiberReady) return { mode: 'fiber' };
 
+  // Strategy 2: check DOM presence (TradingView post-2026 update uses vscode-style Monaco)
+  const domCheck = await evaluate(EDITOR_DOM_PRESENT);
+  if (domCheck && (domCheck.x >= 0 || domCheck.y >= 0)) return { mode: 'dom', textarea: domCheck };
+
+  // Try to open the panel
   await evaluate(`
     (function() {
       var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
@@ -56,7 +75,6 @@ export async function ensurePineEditorOpen() {
       else if (typeof bwb.showWidget === 'function') bwb.showWidget('pine-editor');
     })()
   `);
-
   await evaluate(`
     (function() {
       var btn = document.querySelector('[aria-label="Pine"]')
@@ -67,8 +85,10 @@ export async function ensurePineEditorOpen() {
 
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 200));
-    const ready = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
-    if (ready) return true;
+    const fiber = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+    if (fiber) return { mode: 'fiber' };
+    const dom = await evaluate(EDITOR_DOM_PRESENT);
+    if (dom && (dom.x >= 0 || dom.y >= 0)) return { mode: 'dom', textarea: dom };
   }
   return false;
 }
@@ -248,37 +268,74 @@ export async function getSource() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor or Monaco not found in React fiber tree.');
 
-  const source = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return null;
-      return m.editor.getValue();
-    })()
-  `);
-
-  if (source === null || source === undefined) {
-    throw new Error('Monaco editor found but getValue() returned null.');
+  // Fiber path
+  if (editorReady.mode === 'fiber') {
+    const source = await evaluate(`
+      (function() {
+        var m = ${FIND_MONACO};
+        if (!m) return null;
+        return m.editor.getValue();
+      })()
+    `);
+    if (source === null || source === undefined) throw new Error('Monaco editor found but getValue() returned null.');
+    return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
   }
 
-  return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
+  // DOM path: read textarea value
+  const source = await evaluate(`
+    (function() {
+      var ta = document.querySelector('textarea[aria-label*="Editor content"]')
+        || document.querySelector('.monaco-editor.pine-editor-monaco textarea');
+      return ta ? ta.value : null;
+    })()
+  `);
+  if (!source) throw new Error('DOM-mode: could not read editor textarea value.');
+  return { success: true, source, line_count: source.split('\n').length, char_count: source.length, mode: 'dom' };
 }
 
 export async function setSource({ source }) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
+  // Fiber path: direct setValue
+  if (editorReady.mode === 'fiber') {
+    const escaped = JSON.stringify(source);
+    const set = await evaluate(`
+      (function() {
+        var m = ${FIND_MONACO};
+        if (!m) return false;
+        m.editor.setValue(${escaped});
+        return true;
+      })()
+    `);
+    if (!set) throw new Error('Monaco found but setValue() failed.');
+    return { success: true, lines_set: source.split('\n').length };
+  }
+
+  // DOM path: use native textarea setter to replace content (triggers Monaco's input handler)
   const escaped = JSON.stringify(source);
   const set = await evaluate(`
     (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
+      var ta = document.querySelector('textarea[aria-label*="Editor content"]')
+        || document.querySelector('.monaco-editor.pine-editor-monaco textarea');
+      if (!ta) return false;
+      // Native setter bypasses React synthetic events; dispatched 'input' triggers Monaco
+      var nativeSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+      if (nativeSetter && nativeSetter.set) {
+        nativeSetter.set.call(ta, ${escaped});
+        ta.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      // Fallback: direct assignment
+      ta.value = ${escaped};
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     })()
   `);
-
-  if (!set) throw new Error('Monaco found but setValue() failed.');
-  return { success: true, lines_set: source.split('\n').length };
+  await new Promise(r => setTimeout(r, 500));
+  if (!set) throw new Error('DOM-mode: textarea not found or setValue failed.');
+  return { success: true, lines_set: source.split('\n').length, mode: 'dom' };
 }
 
 export async function compile() {
